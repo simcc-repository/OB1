@@ -4,6 +4,7 @@ services:
       context: .
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://192.168.50.148:8001}
+        SESSION_SECRET: ${SESSION_SECRET}
     container_name: openbrain-dashboard
     restart: unless-stopped
     environment:

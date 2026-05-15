@@ -10,7 +10,13 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ARG NEXT_PUBLIC_API_URL
+ARG SESSION_SECRET
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# SESSION_SECRET must be present at build time because lib/auth.ts validates
+# it at module load, and Next.js collects page data by evaluating modules.
+# The actual session secret used at runtime is supplied via env (see compose);
+# the build value is only required to satisfy the length check.
+ENV SESSION_SECRET=$SESSION_SECRET
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
