@@ -11,7 +11,9 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_BASE = (Deno.env.get("OPENROUTER_BASE_URL") ?? "https://openrouter.ai/api/v1").replace(/\/+$/, "");
+const OPENROUTER_EMBED_MODEL = Deno.env.get("OPENROUTER_EMBED_MODEL") ?? "openai/text-embedding-3-small";
+const OPENROUTER_LLM_MODEL = Deno.env.get("OPENROUTER_LLM_MODEL") ?? "openai/gpt-4o-mini";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 type ThoughtMatch = {
@@ -51,7 +53,7 @@ async function getEmbedding(text: string): Promise<number[]> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
+      model: OPENROUTER_EMBED_MODEL,
       input: text,
     }),
   });
@@ -71,7 +73,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: OPENROUTER_LLM_MODEL,
       response_format: { type: "json_object" },
       messages: [
         {
@@ -90,7 +92,19 @@ Only extract what's explicitly there.`,
   });
   const d = await r.json();
   try {
-    return JSON.parse(d.choices[0].message.content);
+    // Some LLMs (notably Claude/Gemma via openai-compatible proxies) wrap JSON
+    // in markdown fences even when response_format: json_object is requested.
+    const raw: string = d.choices[0].message.content ?? "{}";
+    const stripped = raw.trim()
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
+    const firstBrace = stripped.indexOf("{");
+    const lastBrace = stripped.lastIndexOf("}");
+    const jsonSlice = firstBrace >= 0 && lastBrace > firstBrace
+      ? stripped.slice(firstBrace, lastBrace + 1)
+      : stripped;
+    return JSON.parse(jsonSlice);
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
