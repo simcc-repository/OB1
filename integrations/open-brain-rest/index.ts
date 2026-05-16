@@ -210,6 +210,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
     },
     body: JSON.stringify({
       model: OPENROUTER_LLM_MODEL,
+      temperature: 0.2,
       response_format: { type: "json_object" },
       messages: [
         {
