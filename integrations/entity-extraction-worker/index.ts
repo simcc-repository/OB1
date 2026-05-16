@@ -116,9 +116,19 @@ function isAuthorized(req: Request): boolean {
 // ── LLM Helpers ─────────────────────────────────────────────────────────────
 
 function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/);
-  return match ? match[1].trim() : trimmed;
+  // Permissive: handles leading/trailing prose, unclosed fences, multiple
+  // fenced blocks. Falls back to slicing between the first `{` and last `}`.
+  const stripped = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  const lastBrace = stripped.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return stripped.slice(firstBrace, lastBrace + 1);
+  }
+  return stripped;
 }
 
 function readAnthropicText(payload: unknown): string {

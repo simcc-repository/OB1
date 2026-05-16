@@ -283,11 +283,25 @@ function readAnthropicText(payload: unknown): string {
     .join("");
 }
 
-/** Strip markdown code fences (```json ... ```) that LLMs sometimes wrap around JSON output. */
+/**
+ * Strip markdown code fences (```json ... ```) and surrounding prose that LLMs
+ * sometimes wrap around JSON output. Permissive: handles leading/trailing
+ * prose, unclosed fences, mixed whitespace, multiple fences. Falls back to
+ * slicing between the first `{` and last `}` so naked-prose-with-JSON also
+ * parses.
+ */
 function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  const match = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/);
-  return match ? match[1].trim() : trimmed;
+  const stripped = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  const lastBrace = stripped.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return stripped.slice(firstBrace, lastBrace + 1);
+  }
+  return stripped;
 }
 
 /** True for errors worth retrying: network failures, 429, and 5xx statuses. */
