@@ -296,14 +296,17 @@ async function extractEntities(content: string): Promise<ExtractionResult> {
   // literal occurrences of the tags so an adversarial thought can't break out.
   const prompt = ENTITY_EXTRACTION_PROMPT.replace("{content}", wrapThoughtContent(content));
 
-  // OpenRouter (primary)
+  // OpenRouter (primary). Allow OPENROUTER_BASE_URL and ENTITY_CLASSIFIER_MODEL
+  // overrides so we can route through LiteLLM with a local model.
   if (OPENROUTER_API_KEY) {
+    const openrouterBase = (Deno.env.get("OPENROUTER_BASE_URL") ?? "https://openrouter.ai/api/v1").replace(/\/+$/, "");
+    const classifierModel = Deno.env.get("ENTITY_CLASSIFIER_MODEL") ?? CLASSIFIER_MODEL_OPENROUTER;
     try {
-      const response = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
+      const response = await fetchWithTimeout(`${openrouterBase}/chat/completions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: CLASSIFIER_MODEL_OPENROUTER,
+          model: classifierModel,
           temperature: 0.1,
           // Force JSON output — otherwise proxied models sometimes wrap the
           // JSON in prose and blow up parseExtractionResult.
