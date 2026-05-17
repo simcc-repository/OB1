@@ -215,6 +215,27 @@ Rules:
   injection attempt.`;
 
 /**
+ * System prompt — frames every relation as a SUBJECT→VERB→OBJECT triple to
+ * prevent direction inversions that empirically occur with some classifier
+ * models (e.g. "Surface Laptop 3 uses Lim KT" instead of "Lim KT uses
+ * Surface Laptop 3"). The detailed rules still live in the user prompt as
+ * a redundant safety net.
+ */
+const ENTITY_EXTRACTION_SYSTEM_PROMPT = `You extract typed graph edges from text. Every relation is a SUBJECT→VERB→OBJECT triple.
+
+The SUBJECT goes in the \`from\` field. The OBJECT goes in the \`to\` field.
+
+Examples by relation type:
+  uses:       Lim KT (person, SUBJ) uses Surface Laptop 3 (tool, OBJ)
+  works_on:   Alice (person, SUBJ) works_on OpenBrain (project, OBJ)
+  located_in: Acer Aspire Go 14 (thing, SUBJ) located_in Batam Office (place, OBJ)
+  member_of:  Terence (person, SUBJ) member_of SIMCC (org, OBJ)
+
+Never swap subject and object. A laptop is not a subject of "uses". A place is not a subject of "located_in".
+
+Output JSON only.`;
+
+/**
  * Wrap content in the <thought_content> delimiter used by the extraction
  * prompt, escaping any literal occurrences of the tags so an adversarial
  * thought can't forge a close-tag and break out of the wrapped section.
@@ -331,7 +352,10 @@ async function extractEntities(content: string): Promise<ExtractionResult> {
           // Force JSON output — otherwise proxied models sometimes wrap the
           // JSON in prose and blow up parseExtractionResult.
           response_format: { type: "json_object" },
-          messages: [{ role: "user", content: prompt }],
+          messages: [
+            { role: "system", content: ENTITY_EXTRACTION_SYSTEM_PROMPT },
+            { role: "user", content: prompt },
+          ],
         }),
       });
       if (!response.ok) throw new Error(`OpenRouter failed (${response.status}): ${await response.text()}`);
@@ -351,7 +375,10 @@ async function extractEntities(content: string): Promise<ExtractionResult> {
           model: CLASSIFIER_MODEL_OPENAI,
           temperature: 0.1,
           response_format: { type: "json_object" },
-          messages: [{ role: "user", content: prompt }],
+          messages: [
+            { role: "system", content: ENTITY_EXTRACTION_SYSTEM_PROMPT },
+            { role: "user", content: prompt },
+          ],
         }),
       });
       if (!response.ok) throw new Error(`OpenAI failed (${response.status}): ${await response.text()}`);
@@ -374,6 +401,8 @@ async function extractEntities(content: string): Promise<ExtractionResult> {
         model: CLASSIFIER_MODEL_ANTHROPIC,
         max_tokens: 1024,
         temperature: 0.1,
+        // Anthropic uses a top-level `system` field, not a system message role.
+        system: ENTITY_EXTRACTION_SYSTEM_PROMPT,
         messages: [{ role: "user", content: prompt }],
       }),
     });
