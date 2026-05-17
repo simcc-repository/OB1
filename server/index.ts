@@ -76,6 +76,9 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       model: OPENROUTER_LLM_MODEL,
       temperature: 0.2,
       response_format: { type: "json_object" },
+      // Disable thinking for Qwen3/3.6 reasoning models routed via LiteLLM/vLLM.
+      // Harmless no-op on models that don't honor it (haiku, gpt-4o-mini, etc.).
+      chat_template_kwargs: { enable_thinking: false },
       messages: [
         {
           role: "system",

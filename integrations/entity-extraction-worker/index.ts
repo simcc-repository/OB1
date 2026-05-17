@@ -352,6 +352,9 @@ async function extractEntities(content: string): Promise<ExtractionResult> {
           // Force JSON output — otherwise proxied models sometimes wrap the
           // JSON in prose and blow up parseExtractionResult.
           response_format: { type: "json_object" },
+          // Disable thinking for Qwen3/3.6 reasoning models routed via
+          // LiteLLM/vLLM. Harmless no-op on non-thinking models.
+          chat_template_kwargs: { enable_thinking: false },
           messages: [
             { role: "system", content: ENTITY_EXTRACTION_SYSTEM_PROMPT },
             { role: "user", content: prompt },
