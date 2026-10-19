@@ -1,0 +1,3 @@
+-- SIMCC adaptation of upstream schemas/recency-boosted-match-thoughts/schema.sql
+-- Changed vector(1536) -> vector(1024) for bge-m3. Applied to supabase-db 2026-06-12.
+-- See upstream NateBJones-Projects/OB1 for the original 1536-dim version.

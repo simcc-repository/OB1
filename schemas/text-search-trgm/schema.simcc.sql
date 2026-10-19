@@ -1,0 +1,2 @@
+-- SIMCC: applied upstream schemas/text-search-trgm/schema.sql verbatim to supabase-db 2026-06-12.
+-- pg_trgm extension + idx_thoughts_content_trgm GIN index on thoughts.content.

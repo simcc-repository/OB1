@@ -325,8 +325,32 @@ class ExtractionCostCapError extends Error {
   }
 }
 
+// --- LiteLLM/Langfuse trace attribution ---
+// Adds `user` + `metadata` to the LLM request body so the LiteLLM proxy can
+// group, label, and back-link traces in the `openbrain` Langfuse project.
+// Only injected into the OpenRouter branch (the only one routed via LiteLLM).
+
+const TRACE_USER = Deno.env.get("OPENBRAIN_TRACE_USER") ?? "openbrain:owner=adren";
+
+function traceFields(thoughtId: string, source: string) {
+  return {
+    user: TRACE_USER,
+    metadata: {
+      trace_id: crypto.randomUUID(),
+      session_id: `openbrain:thought=${thoughtId}`,
+      trace_name: "openbrain:extract_entities",
+      tags: ["openbrain", "step:extract_entities", `source:${source}`],
+      trace_metadata: { thought_id: thoughtId, source },
+      generation_name: "extract_entities",
+    },
+  };
+}
+
 /** Try LLM providers in OB1 priority order: OpenRouter → OpenAI → Anthropic. */
-async function extractEntities(content: string): Promise<ExtractionResult> {
+async function extractEntities(
+  content: string,
+  trace: { thoughtId: string; source: string },
+): Promise<ExtractionResult> {
   // Hard cap on LLM calls per container lifetime. 0 disables the cap.
   if (ENTITY_EXTRACTION_MAX_CALLS > 0 && llmCallCount >= ENTITY_EXTRACTION_MAX_CALLS) {
     throw new ExtractionCostCapError(llmCallCount, ENTITY_EXTRACTION_MAX_CALLS);
@@ -359,6 +383,7 @@ async function extractEntities(content: string): Promise<ExtractionResult> {
             { role: "system", content: ENTITY_EXTRACTION_SYSTEM_PROMPT },
             { role: "user", content: prompt },
           ],
+          ...traceFields(trace.thoughtId, trace.source),
         }),
       });
       if (!response.ok) throw new Error(`OpenRouter failed (${response.status}): ${await response.text()}`);
@@ -720,9 +745,14 @@ Deno.serve(async (req) => {
     const attemptCount = queueItem?.attempt_count ?? 0;
 
     // Call LLM for extraction
+    const thoughtSource =
+      asString(meta.source, "") || asString(meta.source_type, "") || "unknown";
     let result: ExtractionResult;
     try {
-      result = await extractEntities(thought.content);
+      result = await extractEntities(thought.content, {
+        thoughtId: item.thought_id,
+        source: thoughtSource,
+      });
     } catch (err) {
       // Cost cap tripped mid-call: don't mark the item failed, return it to
       // pending (via the same remaining-rows cleanup the pre-loop gate uses)

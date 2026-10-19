@@ -45,7 +45,36 @@ function thoughtUrl(id: string): string {
   return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
+// --- LiteLLM/Langfuse trace attribution ---
+// Adds `user` + `metadata` to every LLM request body so the LiteLLM proxy can
+// group, label, and back-link traces in the `openbrain` Langfuse project.
+
+const TRACE_USER = Deno.env.get("OPENBRAIN_TRACE_USER") ?? "openbrain:owner=adren";
+
+type TraceCtx = {
+  sessionId: string;
+  traceName: string;
+  step: string;
+  source: string;
+  traceMetadata: Record<string, unknown>;
+  generationName?: string;
+};
+
+function traceFields(ctx: TraceCtx) {
+  return {
+    user: TRACE_USER,
+    metadata: {
+      trace_id: crypto.randomUUID(),
+      session_id: ctx.sessionId,
+      trace_name: ctx.traceName,
+      tags: ["openbrain", `step:${ctx.step}`, `source:${ctx.source}`],
+      trace_metadata: ctx.traceMetadata,
+      ...(ctx.generationName ? { generation_name: ctx.generationName } : {}),
+    },
+  };
+}
+
+async function getEmbedding(text: string, ctx: TraceCtx): Promise<number[]> {
   const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
     headers: {
@@ -55,6 +84,7 @@ async function getEmbedding(text: string): Promise<number[]> {
     body: JSON.stringify({
       model: OPENROUTER_EMBED_MODEL,
       input: text,
+      ...traceFields(ctx),
     }),
   });
   if (!r.ok) {
@@ -65,7 +95,7 @@ async function getEmbedding(text: string): Promise<number[]> {
   return d.data[0].embedding;
 }
 
-async function extractMetadata(text: string): Promise<Record<string, unknown>> {
+async function extractMetadata(text: string, ctx: TraceCtx): Promise<Record<string, unknown>> {
   const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -92,6 +122,7 @@ Only extract what's explicitly there.`,
         },
         { role: "user", content: text },
       ],
+      ...traceFields(ctx),
     }),
   });
   const d = await r.json();
@@ -138,10 +169,20 @@ server.registerTool(
   },
   async ({ query }) => {
     try {
-      const qEmb = await getEmbedding(query);
+      const qEmb = await getEmbedding(query, {
+        sessionId: `openbrain:search=${crypto.randomUUID()}`,
+        traceName: "openbrain:embed_query",
+        step: "embed_query",
+        source: "search",
+        traceMetadata: { kind: "search_query" },
+        generationName: "embed_query",
+      });
       const { data, error } = await supabase.rpc("match_thoughts", {
         query_embedding: qEmb,
-        match_threshold: 0.5,
+        // 0.35 (not upstream's 0.5): bge-m3 cosine scores for short queries
+        // land in a lower band (~0.35-0.65) than OpenAI embeddings; at 0.5
+        // relevant matches routinely score just under the cutoff and vanish.
+        match_threshold: 0.35,
         match_count: 10,
         filter: {},
       });
@@ -237,18 +278,43 @@ server.registerTool(
     inputSchema: {
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
-      threshold: z.number().optional().default(0.5),
+      // 0.35 (not upstream's 0.5): bge-m3 scores land in a lower band than
+      // OpenAI embeddings; 0.5 filtered out genuinely relevant matches.
+      threshold: z.number().optional().default(0.35),
+      recency_weight: z.number().min(0).max(1).optional().default(0)
+        .describe("0 = pure similarity (default). >0 blends in recency: score = sim*(1-w) + exp(-age/half_life)*w"),
+      half_life_days: z.number().positive().optional().default(90)
+        .describe("Recency decay half-life in days (only used when recency_weight > 0)"),
     },
   },
-  async ({ query, limit, threshold }) => {
+  async ({ query, limit, threshold, recency_weight, half_life_days }) => {
     try {
-      const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: threshold,
-        match_count: limit,
-        filter: {},
+      const qEmb = await getEmbedding(query, {
+        sessionId: `openbrain:search=${crypto.randomUUID()}`,
+        traceName: "openbrain:embed_query",
+        step: "embed_query",
+        source: "search",
+        traceMetadata: { kind: "search_query" },
+        generationName: "embed_query",
       });
+      // recency_weight > 0 opts into the recency-boosted RPC (installed
+      // 2026-06-12, 1024-dim bge-m3 variant). Default 0 keeps behavior
+      // byte-identical to plain match_thoughts.
+      const { data, error } = recency_weight > 0
+        ? await supabase.rpc("match_thoughts_recency", {
+            query_embedding: qEmb,
+            match_threshold: threshold,
+            match_count: limit,
+            filter: {},
+            recency_weight,
+            half_life_days,
+          })
+        : await supabase.rpc("match_thoughts", {
+            query_embedding: qEmb,
+            match_threshold: threshold,
+            match_count: limit,
+            filter: {},
+          });
 
       if (error) {
         return {
@@ -471,14 +537,30 @@ server.registerTool(
   },
   async ({ content }) => {
     try {
+      const captureId = crypto.randomUUID();
+      const sessionId = `openbrain:thought=${captureId}`;
       const [embedding, metadata] = await Promise.all([
-        getEmbedding(content),
-        extractMetadata(content),
+        getEmbedding(content, {
+          sessionId,
+          traceName: "openbrain:embed_thought",
+          step: "embed",
+          source: "mcp",
+          traceMetadata: { capture_id: captureId, source: "mcp" },
+          generationName: "embed_thought",
+        }),
+        extractMetadata(content, {
+          sessionId,
+          traceName: "openbrain:extract_metadata",
+          step: "extract_metadata",
+          source: "mcp",
+          traceMetadata: { capture_id: captureId, source: "mcp" },
+          generationName: "extract_metadata",
+        }),
       ]);
 
       const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
         p_content: content,
-        p_payload: { metadata: { ...metadata, source: "mcp" } },
+        p_payload: { metadata: { ...metadata, source: "mcp", trace_session: captureId } },
       });
 
       if (upsertError) {
@@ -522,6 +604,238 @@ server.registerTool(
   }
 );
 
+// Tool 5: Update Thought
+server.registerTool(
+  "update_thought",
+  {
+    title: "Update Thought",
+    description:
+      "Update a stored thought by ID. Provide one or more of: content, type, importance, metadata. Re-embeds automatically if content changes.",
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+    },
+    inputSchema: {
+      id: z.string().uuid().describe("UUID of the thought to update"),
+      content: z.string().optional().describe("New content (triggers re-embedding)"),
+      type: z.string().optional().describe("Thought type: observation, task, idea, reference, person_note"),
+      importance: z.number().int().min(1).max(5).optional().describe("Importance 1-5"),
+      metadata: z.record(z.string(), z.unknown()).optional().describe("Metadata fields to merge over existing"),
+    },
+  },
+  async ({ id, content, type, importance, metadata }) => {
+    try {
+      const { data: existing, error: fetchErr } = await supabase
+        .from("thoughts")
+        .select("id, content, metadata")
+        .eq("id", id)
+        .single();
+      if (fetchErr || !existing) {
+        return { content: [{ type: "text" as const, text: `Thought ${id} not found` }], isError: true };
+      }
+
+      const mergedMeta = {
+        ...(existing.metadata as Record<string, unknown> || {}),
+        ...(metadata || {}),
+      };
+      if (type) mergedMeta.type = type;
+
+      const update: Record<string, unknown> = { metadata: mergedMeta };
+      const changed: string[] = ["metadata"];
+      if (content !== undefined) {
+        update.content = content;
+        update.embedding = await getEmbedding(content, {
+          sessionId: `openbrain:thought=${id}`,
+          traceName: "openbrain:embed_thought",
+          step: "embed",
+          source: "mcp",
+          traceMetadata: { thought_id: id, source: "mcp" },
+          generationName: "embed_thought",
+        });
+        changed.push("content (re-embedded)");
+      }
+      if (type !== undefined) { update.type = type; changed.push(`type=${type}`); }
+      if (importance !== undefined) { update.importance = importance; changed.push(`importance=${importance}`); }
+
+      const { error: updErr } = await supabase.from("thoughts").update(update).eq("id", id);
+      if (updErr) {
+        return { content: [{ type: "text" as const, text: `Update failed: ${updErr.message}` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: `Updated ${id}: ${changed.join(", ")}` }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// Tool 6: Delete Thought
+server.registerTool(
+  "delete_thought",
+  {
+    title: "Delete Thought",
+    description:
+      "Delete a thought by ID. Cascades to thought_entities and entity_extraction_queue. Irreversible.",
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+    },
+    inputSchema: {
+      id: z.string().uuid().describe("UUID of the thought to delete"),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const { data: existing } = await supabase
+        .from("thoughts")
+        .select("id, content")
+        .eq("id", id)
+        .single();
+      if (!existing) {
+        return { content: [{ type: "text" as const, text: `Thought ${id} not found` }], isError: true };
+      }
+
+      const { error: delErr } = await supabase.from("thoughts").delete().eq("id", id);
+      if (delErr) {
+        return { content: [{ type: "text" as const, text: `Delete failed: ${delErr.message}` }], isError: true };
+      }
+      const c = String(existing.content);
+      const preview = c.slice(0, 60) + (c.length > 60 ? "..." : "");
+      return { content: [{ type: "text" as const, text: `Deleted ${id} ("${preview}")` }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// Tool 7: Merge Thoughts
+server.registerTool(
+  "merge_thoughts",
+  {
+    title: "Merge Thoughts",
+    description:
+      "Merge near-duplicate thoughts into one. Keeps `keep_id`, archives the others into thoughts_archive (recoverable), unions their topics/people/action_items metadata onto the keeper, and optionally replaces the keeper's content (triggers re-embedding and entity re-extraction). Use after spotting duplicates via search_thoughts or the dashboard duplicates view.",
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      keep_id: z.string().uuid().describe("UUID of the thought to keep"),
+      merge_ids: z.array(z.string().uuid()).min(1).max(10).describe("UUIDs of thoughts to merge into the keeper (will be archived)"),
+      merged_content: z.string().optional().describe("Optional consolidated content for the keeper (re-embeds if provided)"),
+    },
+  },
+  async ({ keep_id, merge_ids, merged_content }) => {
+    try {
+      if (merge_ids.includes(keep_id)) {
+        return { content: [{ type: "text" as const, text: "keep_id must not appear in merge_ids" }], isError: true };
+      }
+
+      const allIds = [keep_id, ...merge_ids];
+      const { data: rows, error: fetchErr } = await supabase
+        .from("thoughts")
+        .select("*")
+        .in("id", allIds);
+      if (fetchErr) {
+        return { content: [{ type: "text" as const, text: `Fetch failed: ${fetchErr.message}` }], isError: true };
+      }
+      const byId = new Map((rows || []).map((r: Record<string, unknown>) => [r.id as string, r]));
+      const missing = allIds.filter((id) => !byId.has(id));
+      if (missing.length) {
+        return { content: [{ type: "text" as const, text: `Thought(s) not found: ${missing.join(", ")}` }], isError: true };
+      }
+
+      const keeper = byId.get(keep_id) as Record<string, unknown>;
+      const losers = merge_ids.map((id) => byId.get(id) as Record<string, unknown>);
+
+      // 1. Snapshot losers into the archive (recoverable)
+      const archiveRows = losers.map((t) => ({
+        ...t,
+        archive_reason: "merged",
+        archived_by: "mcp:merge_thoughts",
+        replaced_by: keep_id,
+      }));
+      const { error: archErr } = await supabase.from("thoughts_archive").insert(archiveRows);
+      if (archErr) {
+        return { content: [{ type: "text" as const, text: `Archive failed (nothing merged): ${archErr.message}` }], isError: true };
+      }
+
+      // 2. Union list-valued metadata onto the keeper
+      const keeperMeta = (keeper.metadata as Record<string, unknown>) || {};
+      const mergedMeta: Record<string, unknown> = { ...keeperMeta };
+      for (const key of ["topics", "people", "action_items"]) {
+        const merged = new Set<string>(
+          Array.isArray(keeperMeta[key]) ? (keeperMeta[key] as string[]) : [],
+        );
+        for (const l of losers) {
+          const lm = (l.metadata as Record<string, unknown>) || {};
+          if (Array.isArray(lm[key])) for (const v of lm[key] as string[]) merged.add(v);
+        }
+        if (merged.size) mergedMeta[key] = [...merged];
+      }
+      mergedMeta.merged_from = [
+        ...(Array.isArray(keeperMeta.merged_from) ? (keeperMeta.merged_from as string[]) : []),
+        ...merge_ids,
+      ];
+
+      const maxImportance = Math.max(
+        Number(keeper.importance ?? 3),
+        ...losers.map((l) => Number(l.importance ?? 3)),
+      );
+
+      const update: Record<string, unknown> = { metadata: mergedMeta, importance: maxImportance };
+      if (merged_content !== undefined && merged_content.trim()) {
+        update.content = merged_content.trim();
+        update.embedding = await getEmbedding(merged_content.trim(), {
+          sessionId: `openbrain:thought=${keep_id}`,
+          traceName: "openbrain:embed_thought",
+          step: "embed",
+          source: "mcp",
+          traceMetadata: { thought_id: keep_id, source: "mcp", kind: "merge_reembed" },
+          generationName: "embed_thought",
+        });
+      }
+      const { error: updErr } = await supabase.from("thoughts").update(update).eq("id", keep_id);
+      if (updErr) {
+        return { content: [{ type: "text" as const, text: `Keeper update failed: ${updErr.message}` }], isError: true };
+      }
+
+      // 3. Delete losers (graph links cascade; keeper re-extracts on next hourly run if content changed)
+      const { error: delErr } = await supabase.from("thoughts").delete().in("id", merge_ids);
+      if (delErr) {
+        return { content: [{ type: "text" as const, text: `Delete failed after archive — losers still live. ${delErr.message}` }], isError: true };
+      }
+
+      // 4. Audit log
+      await supabase.from("curation_log").insert({
+        run_id: crypto.randomUUID(),
+        action: "merge",
+        kept_id: keep_id,
+        removed_ids: merge_ids,
+        reason: "manual merge via MCP",
+        confidence: 1.0,
+        dry_run: false,
+      });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Merged ${merge_ids.length} thought(s) into ${keep_id}` +
+            (merged_content ? " (content replaced, re-embedded)" : "") +
+            `. Archived originals are recoverable from thoughts_archive.`,
+        }],
+      };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {
@@ -529,6 +843,84 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
 };
+
+// JSON-RPC error code for unauthorized requests.
+// Per the JSON-RPC 2.0 spec, the range -32099 to -32000 is reserved for
+// implementation-defined server errors. -32001 is the conventional
+// "Unauthorized" code used by MCP clients/servers in the wild.
+//
+// Why a JSON-RPC envelope (HTTP 200) instead of a bare HTTP 401?
+// Strict MCP hosts (Codex CLI, Claude Code) treat bare HTTP 4xx responses
+// as transport-level failures and tear the connection down rather than
+// surfacing the failure to the application layer. Wrapping the auth
+// rejection in a JSON-RPC error keeps the connection alive and lets
+// clients recover (e.g. prompt the user for a new key, refetch a stale
+// cache) instead of dying.
+const JSON_RPC_UNAUTHORIZED_CODE = -32001;
+const UNAUTHORIZED_MESSAGE = "Unauthorized: missing or invalid authentication.";
+
+/**
+ * Read the request body as text without consuming the original request's
+ * body stream for downstream handlers. Returns null on bodyless methods
+ * or read failure. Safe here because it is only called on the auth-reject
+ * path, which returns immediately and never reaches the transport.
+ */
+async function readBodyText(req: Request): Promise<string | null> {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "DELETE") {
+    return null;
+  }
+  try {
+    return await req.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort extraction of the JSON-RPC `id` from a raw request body.
+ * Returns null when the body is missing, not JSON, or not a JSON-RPC
+ * shape with an id. Per the JSON-RPC 2.0 spec, id may be a string,
+ * number, or null — we preserve any of those; anything else becomes null.
+ */
+function extractJsonRpcId(bodyText: string | null): string | number | null {
+  if (!bodyText) return null;
+  try {
+    const parsed = JSON.parse(bodyText);
+    if (parsed && typeof parsed === "object" && "id" in parsed) {
+      const id = (parsed as { id: unknown }).id;
+      if (typeof id === "string" || typeof id === "number" || id === null) {
+        return id;
+      }
+    }
+  } catch {
+    // fall through — malformed body
+  }
+  return null;
+}
+
+/**
+ * Build a JSON-RPC 2.0 error envelope response for auth failures.
+ * Returns HTTP 200 — the JSON-RPC layer expresses the error so that
+ * strict MCP clients keep the connection alive instead of treating
+ * the failure as a transport-level fault.
+ */
+function unauthorizedResponse(id: string | number | null): Response {
+  const body = {
+    jsonrpc: "2.0",
+    error: {
+      code: JSON_RPC_UNAUTHORIZED_CODE,
+      message: UNAUTHORIZED_MESSAGE,
+    },
+    id,
+  };
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders,
+    },
+  });
+}
 
 const app = new Hono();
 
@@ -541,7 +933,14 @@ app.all("*", async (c) => {
   // Accept access key via header OR URL query parameter
   const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
   if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
+    // Return a JSON-RPC 2.0 error envelope (HTTP 200) instead of a bare
+    // HTTP 401 so strict MCP hosts treat this as an application-level
+    // error rather than a transport fault and keep the connection alive.
+    // Best-effort echo of the inbound request id keeps the response
+    // correlated; malformed/missing bodies fall back to id: null.
+    const bodyText = await readBodyText(c.req.raw);
+    const id = extractJsonRpcId(bodyText);
+    return unauthorizedResponse(id);
   }
 
   // Fix: Claude Desktop connectors don't send the Accept header that

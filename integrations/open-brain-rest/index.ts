@@ -182,7 +182,36 @@ function applySort(query: ReturnType<typeof supabase.from> extends { select: (..
   return query.order(sort, { ascending, nullsFirst: false });
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
+// --- LiteLLM/Langfuse trace attribution ---
+// Adds `user` + `metadata` to every LLM request body so the LiteLLM proxy can
+// group, label, and back-link traces in the `openbrain` Langfuse project.
+
+const TRACE_USER = Deno.env.get("OPENBRAIN_TRACE_USER") ?? "openbrain:owner=adren";
+
+type TraceCtx = {
+  sessionId: string;
+  traceName: string;
+  step: string;
+  source: string;
+  traceMetadata: Record<string, unknown>;
+  generationName?: string;
+};
+
+function traceFields(ctx: TraceCtx) {
+  return {
+    user: TRACE_USER,
+    metadata: {
+      trace_id: crypto.randomUUID(),
+      session_id: ctx.sessionId,
+      trace_name: ctx.traceName,
+      tags: ["openbrain", `step:${ctx.step}`, `source:${ctx.source}`],
+      trace_metadata: ctx.traceMetadata,
+      ...(ctx.generationName ? { generation_name: ctx.generationName } : {}),
+    },
+  };
+}
+
+async function getEmbedding(text: string, ctx: TraceCtx): Promise<number[]> {
   if (!OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured");
   const response = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
@@ -193,6 +222,7 @@ async function getEmbedding(text: string): Promise<number[]> {
     body: JSON.stringify({
       model: OPENROUTER_EMBED_MODEL,
       input: text,
+      ...traceFields(ctx),
     }),
   });
   if (!response.ok) throw new Error(`OpenRouter embeddings failed: ${response.status} ${await response.text()}`);
@@ -200,7 +230,7 @@ async function getEmbedding(text: string): Promise<number[]> {
   return data.data[0].embedding;
 }
 
-async function extractMetadata(text: string): Promise<Record<string, unknown>> {
+async function extractMetadata(text: string, ctx: TraceCtx): Promise<Record<string, unknown>> {
   if (!OPENROUTER_API_KEY) return fallbackMetadata(text);
   const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
@@ -223,6 +253,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
         },
         { role: "user", content: text },
       ],
+      ...traceFields(ctx),
     }),
   });
   if (!response.ok) return fallbackMetadata(text);
@@ -338,7 +369,14 @@ async function stats(url: URL) {
 }
 
 async function semanticSearch(body: z.infer<typeof searchSchema>) {
-  const embedding = await getEmbedding(body.query);
+  const embedding = await getEmbedding(body.query, {
+    sessionId: `openbrain:search=${crypto.randomUUID()}`,
+    traceName: "openbrain:embed_query",
+    step: "embed_query",
+    source: "search",
+    traceMetadata: { kind: "search_query" },
+    generationName: "embed_query",
+  });
   const matchCount = Math.min(100, Math.max(body.limit * body.page * 3, body.limit));
   const { data, error } = await supabase.rpc("match_thoughts", {
     query_embedding: embedding,
@@ -412,7 +450,19 @@ async function textSearch(body: z.infer<typeof searchSchema>) {
 
 async function createThought(body: z.infer<typeof captureSchema>) {
   const content = body.content.trim();
-  const extracted = body.metadata ? body.metadata : await extractMetadata(content);
+  const captureId = crypto.randomUUID();
+  const sessionId = `openbrain:thought=${captureId}`;
+  const sourceKind = body.source_type || "dashboard";
+  const extracted = body.metadata
+    ? body.metadata
+    : await extractMetadata(content, {
+        sessionId,
+        traceName: "openbrain:extract_metadata",
+        step: "extract_metadata",
+        source: sourceKind,
+        traceMetadata: { capture_id: captureId, source: sourceKind },
+        generationName: "extract_metadata",
+      });
   const type = body.type || stringMeta(extracted, "type") || "observation";
   const sourceType = body.source_type || stringMeta(extracted, "source") || "dashboard";
   const metadata = {
@@ -420,10 +470,18 @@ async function createThought(body: z.infer<typeof captureSchema>) {
     type,
     source: sourceType,
     source_type: sourceType,
+    trace_session: captureId,
   };
 
   const [embedding, upsert] = await Promise.all([
-    getEmbedding(content),
+    getEmbedding(content, {
+      sessionId,
+      traceName: "openbrain:embed_thought",
+      step: "embed",
+      source: sourceKind,
+      traceMetadata: { capture_id: captureId, source: sourceKind },
+      generationName: "embed_thought",
+    }),
     supabase.rpc("upsert_thought", {
       p_content: content,
       p_payload: { metadata },
@@ -518,7 +576,14 @@ app.put("/thought/:id", async (c) => {
     const update: Record<string, unknown> = { metadata };
     if (parsed.data.content !== undefined) {
       update.content = parsed.data.content;
-      update.embedding = await getEmbedding(parsed.data.content);
+      update.embedding = await getEmbedding(parsed.data.content, {
+        sessionId: `openbrain:thought=${id}`,
+        traceName: "openbrain:embed_thought",
+        step: "embed",
+        source: "dashboard",
+        traceMetadata: { thought_id: id, source: "dashboard" },
+        generationName: "embed_thought",
+      });
     }
     if (parsed.data.type !== undefined) update.type = parsed.data.type;
     if (parsed.data.importance !== undefined) update.importance = parsed.data.importance;

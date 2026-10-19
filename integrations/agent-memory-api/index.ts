@@ -180,7 +180,36 @@ async function sha256Hex(text: string): Promise<string> {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
+// --- LiteLLM/Langfuse trace attribution ---
+// Adds `user` + `metadata` to every LLM request body so the LiteLLM proxy can
+// group, label, and back-link traces in the `openbrain` Langfuse project.
+
+const TRACE_USER = Deno.env.get("OPENBRAIN_TRACE_USER") ?? "openbrain:owner=adren";
+
+type TraceCtx = {
+  sessionId: string;
+  traceName: string;
+  step: string;
+  source: string;
+  traceMetadata: Record<string, unknown>;
+  generationName?: string;
+};
+
+function traceFields(ctx: TraceCtx) {
+  return {
+    user: TRACE_USER,
+    metadata: {
+      trace_id: crypto.randomUUID(),
+      session_id: ctx.sessionId,
+      trace_name: ctx.traceName,
+      tags: ["openbrain", `step:${ctx.step}`, `source:${ctx.source}`],
+      trace_metadata: ctx.traceMetadata,
+      ...(ctx.generationName ? { generation_name: ctx.generationName } : {}),
+    },
+  };
+}
+
+async function getEmbedding(text: string, ctx: TraceCtx): Promise<number[]> {
   const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
     headers: {
@@ -190,6 +219,7 @@ async function getEmbedding(text: string): Promise<number[]> {
     body: JSON.stringify({
       model: OPENROUTER_EMBED_MODEL,
       input: text,
+      ...traceFields(ctx),
     }),
   });
   if (!r.ok) throw new Error(`OpenRouter embeddings failed: ${r.status} ${await r.text()}`);
@@ -342,7 +372,14 @@ app.post("/recall", async (c) => {
   if (!parsed.success) return c.json({ error: "Invalid recall payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
 
-  const embedding = await getEmbedding(req.query);
+  const embedding = await getEmbedding(req.query, {
+    sessionId: `openbrain:search=${crypto.randomUUID()}`,
+    traceName: "openbrain:embed_query",
+    step: "embed_query",
+    source: "agent-memory",
+    traceMetadata: { kind: "agent_memory_recall" },
+    generationName: "embed_query",
+  });
   const { data: matches, error: matchError } = await supabase.rpc("match_thoughts", {
     query_embedding: embedding,
     match_threshold: 0.25,
@@ -463,7 +500,15 @@ app.post("/writeback", async (c) => {
       continue;
     }
 
-    const embedding = await getEmbedding(row.content);
+    const captureId = crypto.randomUUID();
+    const embedding = await getEmbedding(row.content, {
+      sessionId: `openbrain:thought=${captureId}`,
+      traceName: "openbrain:embed_thought",
+      step: "embed",
+      source: "agent-memory",
+      traceMetadata: { capture_id: captureId, source: "agent-memory", workspace_id: req.workspace_id },
+      generationName: "embed_thought",
+    });
     const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
       p_content: row.content,
       p_payload: {
@@ -471,6 +516,7 @@ app.post("/writeback", async (c) => {
           source: "agent_memory",
           source_type: "agent_memory",
           type: row.memory_type,
+          trace_session: captureId,
           topics: req.memory_payload.entities.topics || [],
           people: req.memory_payload.entities.people || [],
           agent_memory: {
